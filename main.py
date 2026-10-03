@@ -1,9 +1,8 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Annotated, TypedDict, List
+from typing import Annotated, TypedDict
 import os
-import shutil
 from datetime import datetime
 
 from langchain_ollama import ChatOllama, OllamaEmbeddings
@@ -27,15 +26,15 @@ app.add_middleware(
 )
 
 # -----------------------------
-# Global components
+# Configuration
 # -----------------------------
 embeddings = OllamaEmbeddings(model="nomic-embed-text")
 llm = ChatOllama(model="llama3.2:3b", temperature=0)
 
 PERSIST_DIR = "./chroma_db"
 DATA_DIR = "./data"
-
 os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(PERSIST_DIR, exist_ok=True)
 
 def get_vectorstore():
     return Chroma(persist_directory=PERSIST_DIR, embedding_function=embeddings)
@@ -45,28 +44,29 @@ def get_vectorstore():
 # -----------------------------
 @tool
 def search_documents(query: str) -> str:
-    """Search across all uploaded research documents. Use this for any question about the content of the documents."""
+    """Search across all uploaded documents. 
+    You MUST use this tool for any question about the content of the documents."""
     vectorstore = get_vectorstore()
     retriever = vectorstore.as_retriever(search_kwargs={"k": 6})
     docs = retriever.invoke(query)
-    
+
     if not docs:
-        return "No relevant information found in the documents."
-    
+        return "No relevant information found in the uploaded documents."
+
     results = []
-    for doc in docs:
+    for i, doc in enumerate(docs, 1):
         source = doc.metadata.get("source", "unknown")
-        results.append(f"[Source: {source}]\n{doc.page_content}")
+        results.append(f"[Source {i}: {source}]\n{doc.page_content}")
     
     return "\n\n---\n\n".join(results)
 
 @tool
 def list_documents() -> str:
     """List all currently uploaded documents."""
-    files = os.listdir(DATA_DIR)
+    files = [f for f in os.listdir(DATA_DIR) if not f.startswith(".")]
     if not files:
         return "No documents have been uploaded yet."
-    return "Uploaded documents:\n" + "\n".join(f"- {f}" for f in files)
+    return "Currently uploaded documents:\n" + "\n".join(f"- {f}" for f in files)
 
 tools = [search_documents, list_documents]
 tool_node = ToolNode(tools)
@@ -78,7 +78,7 @@ llm_with_tools = llm.bind_tools(tools)
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
 
-def agent(state: AgentState):
+def agent_node(state: AgentState):
     response = llm_with_tools.invoke(state["messages"])
     return {"messages": [response]}
 
@@ -89,7 +89,7 @@ def should_continue(state: AgentState):
     return END
 
 workflow = StateGraph(AgentState)
-workflow.add_node("agent", agent)
+workflow.add_node("agent", agent_node)
 workflow.add_node("tools", tool_node)
 workflow.set_entry_point("agent")
 workflow.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
@@ -97,25 +97,25 @@ workflow.add_edge("tools", "agent")
 
 agent_app = workflow.compile()
 
-SYSTEM_PROMPT = """You are a helpful Research Assistant.
-You have access to tools that can search and list uploaded documents.
+SYSTEM_PROMPT = """You are a precise Research Assistant with access to uploaded documents.
 
 Rules:
-- Always use the search_documents tool when the question is about the content of the documents.
-- Cite the source file when possible.
-- Be clear and structured in your answers.
-- If no documents are uploaded or no relevant information is found, say so.
+1. For ANY question about the content of the documents → you MUST use the search_documents tool.
+2. Use list_documents if the user asks what files are available.
+3. Always cite the source file when possible.
+4. Be clear, structured, and factual.
+5. If no relevant information is found, say so honestly.
 """
 
 # -----------------------------
-# API Endpoints
+# API
 # -----------------------------
 class Question(BaseModel):
     question: str
 
 @app.get("/")
 def root():
-    return {"message": "Multi-Document Research Agent is running"}
+    return {"message": "Multi-Document Research Agent is running", "version": "1.1"}
 
 @app.post("/ask")
 def ask(payload: Question):
@@ -125,16 +125,16 @@ def ask(payload: Question):
             HumanMessage(content=payload.question)
         ]
     })
-    
+
     final_message = result["messages"][-1]
     answer = final_message.content
-    
+
     tool_calls = []
     for msg in result["messages"]:
         if hasattr(msg, "tool_calls") and msg.tool_calls:
             for tc in msg.tool_calls:
                 tool_calls.append({"tool": tc["name"], "args": tc["args"]})
-    
+
     return {
         "question": payload.question,
         "answer": answer,
@@ -143,35 +143,34 @@ def ask(payload: Question):
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
-    """Upload a PDF or TXT file to the knowledge base."""
     file_path = os.path.join(DATA_DIR, file.filename)
-    
+
     with open(file_path, "wb") as f:
         content = await file.read()
         f.write(content)
-    
-    # Load and index the document
+
+    # Load document
     if file.filename.lower().endswith(".pdf"):
         loader = PyPDFLoader(file_path)
     else:
         loader = TextLoader(file_path)
-    
+
     docs = loader.load()
     for doc in docs:
         doc.metadata["source"] = file.filename
-    
+
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=100)
     chunks = text_splitter.split_documents(docs)
-    
+
     vectorstore = get_vectorstore()
     vectorstore.add_documents(chunks)
-    
+
     return {
-        "message": f"Successfully uploaded and indexed {file.filename}",
-        "chunks": len(chunks)
+        "message": f"Successfully uploaded and indexed '{file.filename}'",
+        "chunks_added": len(chunks)
     }
 
 @app.get("/documents")
 def list_docs():
-    files = os.listdir(DATA_DIR)
+    files = [f for f in os.listdir(DATA_DIR) if not f.startswith(".")]
     return {"documents": files}
