@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Annotated, TypedDict
 import os
-from datetime import datetime
+import shutil
 
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_chroma import Chroma
@@ -33,6 +33,7 @@ llm = ChatOllama(model="llama3.2:3b", temperature=0)
 
 PERSIST_DIR = "./chroma_db"
 DATA_DIR = "./data"
+
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(PERSIST_DIR, exist_ok=True)
 
@@ -45,7 +46,8 @@ def get_vectorstore():
 @tool
 def search_documents(query: str) -> str:
     """Search across all uploaded documents. 
-    You MUST use this tool for any question about the content of the documents."""
+    You MUST use this tool for any question about the content of the documents.
+    Always include the source filename in your final answer."""
     vectorstore = get_vectorstore()
     retriever = vectorstore.as_retriever(search_kwargs={"k": 6})
     docs = retriever.invoke(query)
@@ -56,7 +58,7 @@ def search_documents(query: str) -> str:
     results = []
     for i, doc in enumerate(docs, 1):
         source = doc.metadata.get("source", "unknown")
-        results.append(f"[Source {i}: {source}]\n{doc.page_content}")
+        results.append(f"[Source: {source}]\n{doc.page_content}")
     
     return "\n\n---\n\n".join(results)
 
@@ -97,25 +99,25 @@ workflow.add_edge("tools", "agent")
 
 agent_app = workflow.compile()
 
-SYSTEM_PROMPT = """You are a precise Research Assistant with access to uploaded documents.
+SYSTEM_PROMPT = """You are a precise Research Assistant.
 
 Rules:
-1. For ANY question about the content of the documents → you MUST use the search_documents tool.
-2. Use list_documents if the user asks what files are available.
-3. Always cite the source file when possible.
-4. Be clear, structured, and factual.
+1. For ANY question about the content of the documents → ALWAYS use the search_documents tool first.
+2. Use list_documents when the user asks what files are available.
+3. In your final answer, clearly cite the source filename(s) you used.
+4. Be structured, concise, and factual.
 5. If no relevant information is found, say so honestly.
 """
 
 # -----------------------------
-# API
+# API Endpoints
 # -----------------------------
 class Question(BaseModel):
     question: str
 
 @app.get("/")
 def root():
-    return {"message": "Multi-Document Research Agent is running", "version": "1.1"}
+    return {"message": "Multi-Document Research Agent is running", "version": "1.2"}
 
 @app.post("/ask")
 def ask(payload: Question):
@@ -149,7 +151,6 @@ async def upload(file: UploadFile = File(...)):
         content = await file.read()
         f.write(content)
 
-    # Load document
     if file.filename.lower().endswith(".pdf"):
         loader = PyPDFLoader(file_path)
     else:
@@ -174,3 +175,19 @@ async def upload(file: UploadFile = File(...)):
 def list_docs():
     files = [f for f in os.listdir(DATA_DIR) if not f.startswith(".")]
     return {"documents": files}
+
+@app.delete("/clear")
+def clear_knowledge_base():
+    """Clear all uploaded documents and reset the vector store."""
+    # Remove all files in data/
+    for filename in os.listdir(DATA_DIR):
+        file_path = os.path.join(DATA_DIR, filename)
+        if os.path.isfile(file_path):
+            os.remove(file_path)
+
+    # Reset Chroma
+    if os.path.exists(PERSIST_DIR):
+        shutil.rmtree(PERSIST_DIR)
+    os.makedirs(PERSIST_DIR, exist_ok=True)
+
+    return {"message": "Knowledge base cleared successfully. All documents and embeddings removed."}
